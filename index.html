@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Банка RECYCLE — 3D модель</title>
+    <style>
+        * { margin: 0; padding: 0; }
+        body {
+            min-height: 100vh;
+            background: #e8e8e8;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        #container {
+            width: 660px;
+            height: 270px;
+            cursor: pointer;
+            position: relative;
+            /* overflow намеренно не hidden — холст свисает вниз,
+               банка летит до реального низа экрана */
+        }
+        #container canvas {
+            display: block;
+            position: absolute;
+            top: 0; left: 0;
+            width: 660px !important;
+            height: 1506px !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="container"></div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+        const container = document.getElementById('container');
+        const LERP     = 0.18;   // чуть быстрее — отклик как у кнопки
+        const MAX_TILT = 2.5;    // почти нет наклона
+
+        let targetRx = 0, targetRy = 0;
+        let currentRx = 0, currentRy = 0;
+        let rafId = null;
+
+        // Масштаб для эффекта кнопки: hover → 0.96, click → 0.91, обычный → 1.0
+        let targetScale = 1.0, currentScale = 1.0;
+        let isHovered = false;
+        let can = null;
+        let baseRotX = 0, baseRotY = 0, baseRotZ = 0;
+        let currentModel = 0;
+        const models = ['can_model.glb', 'can_crushed.glb', 'can_crushed2.glb', 'can_crushed3.glb'];
+        const preloaded = [];        // предзагруженные группы
+        const baseRotations = [];    // исходные повороты для каждой модели
+        const modelMeshes = [];      // все меши каждой модели — для fade-out
+        const allDrops = [];         // allDrops[idx] = массив объектов капель конденсата
+        let allLoaded = false;
+        let canShowTime = 0;         // когда текущая банка стала активной (секунды)
+
+        // Машина состояний для анимации падения
+        // idle → (клик на 4-ю) → waiting (1с) → falling → resetting (0.4с) → idle (модель 0)
+        let phase = 'idle';   // 'idle' | 'waiting' | 'falling' | 'resetting'
+        let phaseTimer = 0;
+        let fallVy = 0;
+        let fallRvx = 0, fallRvz = 0;
+        let lastTime = 0;
+        const GRAVITY = 7.0;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xe8e8e8);
+
+        // Асимметричный frustum: верхние 270px — оригинальный вид (±0.69 ед.),
+        // холст расширен до 720px вниз → банка падает в скрытые 450px без GPU-клипа.
+        const CAM_D = 5 / 3, NEAR = 0.1, FAR = 100;
+        const TOP_W = 0.69, BOTTOM_W = -7.0;  // нижняя граница расширена — банка летит далеко вниз
+        const RIGHT_W = 1.69;
+        // NDC диапазон для видимой области (270px из 1506px холста):
+        // NDC +1 = TOP_W, NDC -1 = BOTTOM_W.
+        // Нижняя граница контейнера = world y = -TOP_W = -0.69
+        // NDC_Y_BOT = 2*(−TOP_W − BOTTOM_W)/(TOP_W − BOTTOM_W) − 1
+        const NDC_Y_TOP = 1.0;
+        const NDC_Y_BOT = 2 * (-TOP_W - BOTTOM_W) / (TOP_W - BOTTOM_W) - 1; // ≈ 0.641
+        const s = NEAR / CAM_D;
+        const camera = new THREE.PerspectiveCamera(45, 660 / 270, NEAR, FAR);
+        camera.position.set(0, 0, CAM_D);
+        camera.lookAt(0, 0, 0);
+        // Перезаписываем матрицу проекции на асимметричный frustum
+        camera.projectionMatrix.makePerspective(
+            -RIGHT_W * s, RIGHT_W * s, TOP_W * s, BOTTOM_W * s, NEAR, FAR
+        );
+        camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+
+        // canvas height = (TOP_W + |BOTTOM_W|) / 1.38 * 270 = 7.69/1.38*270 ≈ 1506px
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(660, 1506);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.outputColorSpace = THREE.SRGBColorSpace;
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.4;
+        container.appendChild(renderer.domElement);
+
+        // RoomEnvironment — даёт металлу реальные отражения как в Blender
+        const pmrem = new THREE.PMREMGenerator(renderer);
+        scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+        // Ambient — базовое освещение
+        const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambient);
+
+        // Ключевой свет сверху-слева
+        const key = new THREE.DirectionalLight(0xffffff, 1.4);
+        key.position.set(-3, 4, 5);
+        scene.add(key);
+
+        const fill = new THREE.DirectionalLight(0xffffff, 0.6);
+        fill.position.set(3, 1, 3);
+        scene.add(fill);
+
+        const rim = new THREE.DirectionalLight(0xffffff, 0.5);
+        rim.position.set(0, -3, -2);
+        scene.add(rim);
+
+        const top = new THREE.DirectionalLight(0xffffff, 0.4);
+        top.position.set(0, 5, 0);
+        scene.add(top);
+
+        // Фронтальный свет — важен для 4-го состояния (плоская банка)
+        const front = new THREE.DirectionalLight(0xffffff, 1.2);
+        front.position.set(0, 0, 10);
+        scene.add(front);
+
+        const loader = new GLTFLoader();
+        // Brushed aluminum материал — точно как в Blender
+        const canMat = new THREE.MeshStandardMaterial({
+            color: 0xdddfe4,
+            metalness: 1.0,
+            roughness: 0.24,
+            envMapIntensity: 1.2,
+            side: THREE.DoubleSide,
+        });
+        const textMat = new THREE.MeshStandardMaterial({
+            color: 0x60636b,
+            metalness: 0.9,
+            roughness: 0.42,
+            envMapIntensity: 1.0,
+        });
+
+        // Предзагружаем шрифт
+        let loadedFont = null;
+        new FontLoader().load('https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json', f => { loadedFont = f; });
+
+        // Устанавливает прозрачность всех мешей модели (0 = невидимая, 1 = полная)
+        function setModelOpacity(idx, opacity) {
+            if (!modelMeshes[idx]) return;
+            modelMeshes[idx].forEach(m => {
+                m.material.transparent = opacity < 1;
+                m.material.opacity = opacity;
+            });
+        }
+
+        // ===== CONDENSATION SYSTEM =====
+        // Материал капли — стекловидная вода: видимая, с синеватым оттенком и преломлением
+        const dropMaterial = new THREE.MeshPhysicalMaterial({
+            color:               new THREE.Color(0xffffff),  // бесцветный — чистое стекло
+            transparent:         true,
+            opacity:             0,
+            roughness:           0.0,   // зеркально гладкая поверхность
+            metalness:           0.0,
+            transmission:        0.82,  // ~80% прозрачный — видно, но выглядит как стекло
+            thickness:           0.5,
+            ior:                 1.50,  // стекло/вода
+            envMapIntensity:     3.0,
+            specularIntensity:   1.0,
+            specularColor:       new THREE.Color(0xffffff),
+            clearcoat:           1.0,   // зеркальный блик сверху
+            clearcoatRoughness:  0.0,
+            attenuationDistance: 0.10,  // короткое — центр капли слегка окрашен в холодный тон
+            attenuationColor:    new THREE.Color(0x90c8e8),  // прохладный голубой через толщу капли
+            depthWrite:          false,
+        });
+
+        function buildCondensation(group, size, modelIdx) {
+            const N = modelIdx === 0 ? 48 : modelIdx === 1 ? 40 : 32;
+
+            // ── Определяем ось банки по наибольшему измерению bounding box ──
+            // axisIdx: 0=X (горизонтальная), 1=Y (вертикальная), 2=Z (горизонтальная)
+            const axisIdx = (size.x >= size.y && size.x >= size.z) ? 0
+                          : (size.y >= size.z) ? 1 : 2;
+
+            // Полуоси эллиптического сечения банки (учитываем реальную форму, включая помятые)
+            let semiA, semiB, halfH, canBottomY, axisA, axisB;
+            if (axisIdx === 0) {        // горизонт., ось X → сечение в YZ
+                semiA      = size.y / 2;   // полуось по Y (высота)
+                semiB      = size.z / 2;   // полуось по Z (глубина, к камере)
+                halfH      = size.x * 0.44;
+                canBottomY = -semiA;       // реальный низ банки, а не max
+            } else if (axisIdx === 1) { // вертикальная, ось Y → сечение в XZ
+                semiA      = size.z / 2;
+                semiB      = size.x / 2;
+                halfH      = size.y * 0.46;
+                canBottomY = -size.y / 2;
+            } else {                    // горизонт., ось Z → сечение в XY
+                semiA      = size.y / 2;
+                semiB      = size.x / 2;
+                halfH      = size.z * 0.44;
+                canBottomY = -semiA;
+            }
+            // Характерный "радиус" — полуось к камере (max для совместимости с sz)
+            const radius = Math.max(semiA, semiB);
+            // Эллиптический радиус при угле theta: r(θ) = semiA·semiB / √(semiB²·sin²θ + semiA²·cos²θ)
+            const ellipR = (theta) => {
+                const sinT = Math.sin(theta), cosT = Math.cos(theta);
+                return (semiA * semiB) / Math.sqrt(semiB * semiB * sinT * sinT + semiA * semiA * cosT * cosT);
+            };
+
+            const bodyMesh = (modelMeshes[modelIdx] || []).find(
+                m => !(m.name || '').toUpperCase().includes('RECYCLE')
+            ) || null;
+            const drops = [];
+
+            for (let i = 0; i < N; i++) {
+                // Только центральная зона ±45° — без самого верха и самого низа
+                const theta = (Math.random() - 0.5) * (Math.PI / 2);
+                // Позиция вдоль оси банки
+                const along = (Math.random() * 2 - 1) * halfH;
+                // Размер — доля от b (полуось к камере):
+                const sz = semiB * (0.015 + Math.random() * 0.055);
+                const isLarge  = sz > radius * 0.10;
+                const isMedium = sz > radius * 0.06 && sz <= radius * 0.10;
+
+                // Скорость роста: медленная — от 5 до 14 секунд до полного размера
+                const growTime = 5.0 + Math.random() * 9.0;
+                const growRate = sz / growTime;
+
+                // Все капли в итоге сползают — просто с разной задержкой
+                const willSlide = true;
+                const slideDelay = isLarge
+                    ? 4.0  + Math.random() * 8.0
+                    : isMedium
+                        ? 12.0 + Math.random() * 16.0
+                        : 25.0 + Math.random() * 30.0;
+
+                const geo = new THREE.SphereGeometry(sz, 12, 9);
+                const mat = dropMaterial.clone();
+                mat.thickness = sz * 10;  // толщина для attenuation-окраски центра
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.scale.setScalar(0.001);
+                mat.opacity = 0;
+
+                // Позиция на поверхности эллипса: r(θ) + небольшой вынос наружу
+                const re = ellipR(theta) + sz * 0.5;
+                let px, py, pz;
+                if (axisIdx === 0) {
+                    px = along; py = Math.sin(theta) * re; pz = Math.cos(theta) * re;
+                } else if (axisIdx === 1) {
+                    px = Math.sin(theta) * re; py = along; pz = Math.cos(theta) * re;
+                } else {
+                    px = Math.sin(theta) * re; py = Math.cos(theta) * re; pz = along;
+                }
+                const pos = new THREE.Vector3(px, py, pz);
+                mesh.position.copy(pos);
+                group.add(mesh);
+
+                drops.push({
+                    mesh,
+                    basePos:    pos.clone(),
+                    theta,
+                    radius,
+                    semiA, semiB, ellipR, // эллиптический профиль для respawn
+                    axisIdx,
+                    phase:        'waiting',
+                    appearAt:     1.5 + Math.random() * 10.0,
+                    fogActivated: false,
+                    opacity:      0,
+                    sz,
+                    currentSz:    0,
+                    growRate,
+                    willSlide,
+                    slideDelay,
+                    slideStartAt: 0,
+                    slideVy:      0,
+                    slideVx:      0,
+                    trailRadius:  0.006,
+                    dripTimer:    0,
+                    fallVy:       0,
+                    halfH,
+                    canBottomY,
+                    bodyMesh,
+                    vx: 0, vy: 0, vz: 0,
+                });
+            }
+            return drops;
+        }
+
+        const _wpBuf = new THREE.Vector3();
+
+        function updateCondensation(drops, elapsed, dt) {
+            drops.forEach(d => {
+                // Перерождение: капля умерла — возрождается только при достаточном запотевании
+                if (d.phase === 'dead' && globalFogLevel >= 0.82) {
+                    // Та же зона ±45° что и при первом появлении
+                    const newTheta = (Math.random() - 0.5) * (Math.PI / 2);
+                    const newAlong = (Math.random() < 0.65)
+                        ? d.halfH * (0.1 + Math.random() * 0.9)
+                        : d.halfH * (-0.9 + Math.random() * 0.9);
+                    const re = d.ellipR(newTheta) + d.sz * 0.5;
+                    let nx, ny, nz;
+                    if (d.axisIdx === 0) {
+                        nx = newAlong; ny = Math.sin(newTheta) * re; nz = Math.cos(newTheta) * re;
+                    } else if (d.axisIdx === 1) {
+                        nx = Math.sin(newTheta) * re; ny = newAlong; nz = Math.cos(newTheta) * re;
+                    } else {
+                        nx = Math.sin(newTheta) * re; ny = Math.cos(newTheta) * re; nz = newAlong;
+                    }
+                    d.mesh.position.set(nx, ny, nz);
+                    d.basePos.set(nx, ny, nz);
+                    d.theta      = newTheta;
+                    d.currentSz  = 0;
+                    d.opacity    = 0;
+                    d.slideVy    = 0;
+                    d.slideVx    = 0;
+                    d.trailRadius = 0.006;
+                    d.fallVy     = 0;
+                    d._drip_wp   = null;
+                    d.mesh.rotation.z = 0;
+                    d.mesh.scale.setScalar(0.001);
+                    d.mesh.material.opacity = 0;
+                    d.phase        = 'waiting';
+                    d.fogActivated = true;  // fog уже есть — сразу ставим задержку вперёд
+                    d.appearAt     = elapsed + 3.0 + Math.random() * 12.0;
+                    d.slideDelay = d.sz > d.radius * 0.10
+                        ? 3  + Math.random() * 7
+                        : d.sz > d.radius * 0.06
+                            ? 10 + Math.random() * 14
+                            : 22 + Math.random() * 28;
+                    d.slideStartAt = 0;
+                    return;
+                }
+
+                if (d.phase === 'waiting') {
+                    // Fog-gate: когда запотевание впервые доходит до нужного уровня,
+                    // перераспределяем appearAt равномерно вперёд, чтобы капли не выскакивали одновременно
+                    if (!d.fogActivated && globalFogLevel >= 0.82) {
+                        d.fogActivated = true;
+                        d.appearAt = elapsed + Math.random() * 15.0; // растянуть на 15 сек вперёд
+                    }
+                    if (d.fogActivated && elapsed >= d.appearAt) {
+                        d.phase = 'growing';
+                        d.currentSz = 0;
+                    }
+
+                } else if (d.phase === 'growing') {
+                    // Капля медленно растёт — без прыжков и деформаций
+                    d.currentSz = Math.min(d.currentSz + d.growRate * dt, d.sz);
+                    const frac = d.currentSz / d.sz;
+                    d.mesh.scale.setScalar(frac);        // равномерный рост — шар
+                    d.opacity = frac * 0.88;
+                    d.mesh.material.opacity = d.opacity;
+                    if (d.currentSz >= d.sz) {
+                        d.phase = 'visible';
+                        d.mesh.scale.setScalar(1);      // остаётся шаром — без резкого сжатия
+                        d.slideStartAt = elapsed;
+                    }
+
+                } else if (d.phase === 'visible') {
+                    // Если капля уже близко к нижней части поверхности — задержка короче
+                    // Для горизонт. банки (ось X/Z): Y = высота над/под осью цилиндра
+                    // Для вертикальной (ось Y): Y = позиция вдоль оси
+                    const nearBottomThreshold = d.axisIdx === 1
+                        ? -d.halfH * 0.4   // вертикальная: близко к торцу
+                        : -d.radius * 0.3; // горизонтальная: близко к нижней образующей
+                    const bottomBonus = d.basePos.y < nearBottomThreshold
+                        ? d.slideDelay * 0.35 : 0;
+                    if ((elapsed - d.slideStartAt) > d.slideDelay - bottomBonus) {
+                        d.phase  = 'sliding';
+                        d.slideVy = 0;
+                        d.slideVx = 0;
+                    }
+
+                } else if (d.phase === 'sliding') {
+                    // Гравитация — ускорение вниз
+                    d.slideVy = Math.max(d.slideVy - 0.10 * dt, -0.50);
+
+                    // Хаотичный боковой дрейф
+                    d.slideVx += (Math.random() - 0.5) * 0.8 * dt;
+                    d.slideVx *= Math.exp(-3.0 * dt);
+                    d.slideVx  = Math.max(-0.6, Math.min(0.6, d.slideVx));
+
+                    const r = d.radius + d.currentSz * 0.5;
+
+                    if (d.axisIdx === 1) {
+                        // ── Вертикальная банка (ось Y) ──
+                        // theta дрейфует в плоскости XZ, Y убывает вниз
+                        d.theta += d.slideVx * dt * 0.20;
+                        d.mesh.position.x  = Math.sin(d.theta) * r;
+                        d.mesh.position.z  = Math.cos(d.theta) * r;
+                        d.mesh.position.y += d.slideVy * dt;
+
+                    } else if (d.axisIdx === 0) {
+                        // ── Горизонтальная банка (ось X) ──
+                        // Y убывает (гравитация к нижней части цилиндра),
+                        // Z следует за theta чтобы оставаться на поверхности,
+                        // X дрейфует вдоль оси
+                        d.mesh.position.y += d.slideVy * dt;
+                        const yy = Math.max(-r, d.mesh.position.y);
+                        d.mesh.position.y  = yy;
+                        d.theta = Math.asin(Math.max(-1, Math.min(1, yy / r)));
+                        d.mesh.position.z  = Math.cos(d.theta) * r;
+                        d.mesh.position.x += d.slideVx * dt * 0.25;
+                        d.mesh.position.x  = Math.max(-d.halfH, Math.min(d.halfH, d.mesh.position.x));
+
+                    } else {
+                        // ── Горизонтальная банка (ось Z) ──
+                        d.mesh.position.y += d.slideVy * dt;
+                        const yy = Math.max(-r, d.mesh.position.y);
+                        d.mesh.position.y  = yy;
+                        d.theta = Math.asin(Math.max(-1, Math.min(1, yy / r)));
+                        d.mesh.position.x  = Math.cos(d.theta) * r;
+                        d.mesh.position.z += d.slideVx * dt * 0.25;
+                        d.mesh.position.z  = Math.max(-d.halfH, Math.min(d.halfH, d.mesh.position.z));
+                    }
+
+                    // Каплевидная форма нарастает плавно — чем быстрее, тем сильнее вытяжка
+                    const spd = Math.min(1, Math.abs(d.slideVy) / 0.25);
+                    const sclX = 1.0 - spd * 0.15;
+                    const sclY = 1.0 + spd * 0.30;
+                    d.mesh.scale.set(sclX, sclY, sclX);
+                    d.mesh.rotation.z = -d.slideVx * 0.8;
+
+                    // Полоса стирания запотевания расширяется по мере движения
+                    d.trailRadius = Math.min(d.trailRadius + dt * 0.004, 0.035);
+
+                    // Поглощение соседних мелких капель
+                    drops.forEach(other => {
+                        if (other === d) return;
+                        if (other.phase !== 'visible' && other.phase !== 'growing') return;
+                        const dx = d.mesh.position.x - other.mesh.position.x;
+                        const dy = d.mesh.position.y - other.mesh.position.y;
+                        const dz = d.mesh.position.z - other.mesh.position.z;
+                        const thr = (d.currentSz + other.currentSz) * 1.9;
+                        if (dx*dx + dy*dy + dz*dz < thr * thr) {
+                            other.phase = 'dying';
+                            d.currentSz = Math.min(d.currentSz * 1.06, d.sz * 1.5);
+                        }
+                    });
+
+                    // Стираем запотевание
+                    if (d.bodyMesh && d.bodyMesh.geometry.userData.hAxis !== undefined) {
+                        d.mesh.getWorldPosition(_wpBuf);
+                        d.bodyMesh.worldToLocal(_wpBuf);
+                        const _uv = uvFromMeshLocal(_wpBuf, d.bodyMesh.geometry.userData);
+                        fogEraseAt(_uv.u, _uv.v, d.trailRadius);
+                    }
+
+                    // Дошла до нижней точки поверхности — начинаем dripping
+                    if (d.mesh.position.y < d.canBottomY + d.sz * 0.5) {
+                        d.phase     = 'dripping';
+                        d.dripTimer = 0;
+                        d.slideVy   = 0;
+                        const rD = d.radius + d.currentSz * 0.5;
+                        if (d.axisIdx === 0) {
+                            // Ось X: нижняя точка — y=-r, z=0, x — вдоль оси (не трогаем)
+                            d.mesh.position.y = d.canBottomY;
+                            d.mesh.position.z = 0;
+                        } else if (d.axisIdx === 1) {
+                            // Ось Y (вертикальная): нижний торец
+                            d.mesh.position.x = Math.sin(d.theta) * rD;
+                            d.mesh.position.z = Math.cos(d.theta) * rD;
+                            d.mesh.position.y = d.canBottomY;
+                        } else {
+                            // Ось Z: нижняя точка — y=-r, x=0, z — вдоль оси
+                            d.mesh.position.y = d.canBottomY;
+                            d.mesh.position.x = 0;
+                        }
+                        if (!d._drip_wp) d._drip_wp = new THREE.Vector3();
+                        d.mesh.getWorldPosition(d._drip_wp);
+                    }
+
+                } else if (d.phase === 'dripping') {
+                    // Зависает у нижнего края, набухает и медленно свешивается
+                    d.dripTimer += dt;
+                    const hang = Math.min(d.dripTimer / 0.55, 1.0);
+                    d.mesh.scale.set(1.0 + hang * 0.55, 1.0 - hang * 0.25, 1.0 + hang * 0.55);
+                    d.mesh.position.y = d.canBottomY - hang * d.sz * 2.0;
+                    const rD = d.radius + d.currentSz * 0.5;
+                    if (d.axisIdx === 0) {
+                        // Ось X: z=0 (снизу), x — по оси
+                        d.mesh.position.z = 0;
+                    } else if (d.axisIdx === 1) {
+                        // Ось Y: фиксируем XZ по theta
+                        d.mesh.position.x = Math.sin(d.theta) * rD;
+                        d.mesh.position.z = Math.cos(d.theta) * rD;
+                    } else {
+                        // Ось Z: x=0 (снизу), z — по оси
+                        d.mesh.position.x = 0;
+                    }
+                    if (!d._drip_wp) d._drip_wp = new THREE.Vector3();
+                    d.mesh.getWorldPosition(d._drip_wp);
+
+                    if (d.dripTimer > 0.4 + Math.random() * 0.5) {
+                        d.phase  = 'falling_off';
+                        d.fallVy = 0;
+                        d.mesh.scale.set(0.9, 1.2, 0.9); // слегка вытянутая — каплевидная
+                    }
+
+                } else if (d.phase === 'falling_off') {
+                    // Свободное падение в МИРОВОМ пространстве — строго вниз
+                    d.fallVy -= 3.5 * dt;
+                    d._drip_wp.y += d.fallVy * dt;
+
+                    // Конвертируем мировую позицию обратно в локальную группы
+                    if (d.mesh.parent) {
+                        _wpBuf.copy(d._drip_wp);
+                        d.mesh.parent.worldToLocal(_wpBuf);
+                        d.mesh.position.copy(_wpBuf);
+                    }
+
+                    // Медленное затухание — капля успевает улететь далеко
+                    d.opacity -= dt * 0.7;
+                    d.mesh.material.opacity = Math.max(0, d.opacity);
+                    if (d.opacity <= 0) d.phase = 'dead';
+
+                } else if (d.phase === 'dying') {
+                    d.opacity -= dt * 2.5;
+                    d.mesh.material.opacity = Math.max(0, d.opacity);
+                    if (d.opacity <= 0) d.phase = 'dead';
+
+                }
+            });
+        }
+
+        // Глобальный пул отсоединённых брызг — обновляются в animate независимо от текущей модели
+        const _flyMeshes = [];
+
+        // Материал для брызг — простой, без стеклянного эффекта
+        const _splashMat = new THREE.MeshStandardMaterial({
+            color:       new THREE.Color(0xb8d8ea),
+            transparent: true,
+            opacity:     0.75,
+            roughness:   0.4,
+            metalness:   0.0,
+            depthWrite:  false,
+        });
+
+        function triggerSplash(drops) {
+            drops.forEach(d => {
+                if (d.phase === 'waiting' || d.phase === 'dead' || d.phase === 'growing') return;
+
+                // Мировая позиция капли
+                const wp = new THREE.Vector3();
+                d.mesh.getWorldPosition(wp);
+
+                // Размер частицы в мировых единицах = sz * groupScale
+                const groupScale = d.mesh.parent ? d.mesh.parent.scale.x : 1.0;
+                const worldSz = d.sz * groupScale * (0.6 + Math.random() * 0.6);
+
+                // Создаём одноразовую простую частицу-брызг
+                const geo  = new THREE.SphereGeometry(worldSz, 6, 5);
+                const mat  = _splashMat.clone();
+                mat.opacity = 0.5 + Math.random() * 0.35;
+                const mesh = new THREE.Mesh(geo, mat);
+                mesh.position.copy(wp);
+                scene.add(mesh);
+
+                // Направление: от центра банки наружу + хаотичный разброс
+                const len = Math.sqrt(wp.x * wp.x + wp.z * wp.z) || 0.01;
+                const spd = 0.08 + Math.random() * 0.22;
+
+                const fly = {
+                    mesh,
+                    vx:  (wp.x / len) * spd * 0.6 + (Math.random() - 0.5) * 0.20,
+                    vy:  0.04 + Math.random() * 0.16,
+                    vz:  (wp.z / len) * spd       + (Math.random() - 0.5) * 0.12,
+                    opacity: mat.opacity,
+                    age: 0,
+                    drop: null,        // это временная частица, не оригинальный drop-меш
+                    parentGroup: null,
+                };
+                _flyMeshes.push(fly);
+
+                // Оригинальный drop — просто убиваем, он возродится как обычно
+                d.phase = 'dead';
+                d.mesh.material.opacity = 0;
+                d.mesh.scale.setScalar(0.001);
+            });
+        }
+
+        function resetDrops(drops) {
+            drops.forEach(d => {
+                d.phase        = 'waiting';
+                d.fogActivated = false;
+                d.opacity      = 0;
+                d.currentSz    = 0;
+                d.mesh.material.opacity = 0;
+                d.mesh.scale.setScalar(0.001);
+                d.vx = d.vy = d.vz = 0;
+                d.slideVy = 0;
+                d.slideVx = 0;
+                d.fallVy    = 0;
+                d.dripTimer = 0;
+                d._drip_wp  = null;
+                d.slideStartAt = 0;
+                d.trailRadius = 0.006;
+                d.mesh.rotation.z = 0;
+                d.mesh.position.copy(d.basePos);
+                d.appearAt   = 1.5 + Math.random() * 10.0;  // сбрасываем (fogActivated перезапустит)
+                d.slideDelay = d.sz > d.radius * 0.10
+                    ? 3.0 + Math.random() * 7.0
+                    : d.sz > d.radius * 0.06
+                        ? 10  + Math.random() * 14
+                        : 22  + Math.random() * 28;
+            });
+        }
+        // ===== END CONDENSATION =====
+
+        // ===== FOGGING — canvas roughnessMap, общий для всех состояний =====
+        // Запотевание — ОДНА текстура на все 4 банки, рисунок мышью передаётся.
+
+        const FOG_RES = 256;
+        const fogCanvas2D = document.createElement('canvas');
+        fogCanvas2D.width = fogCanvas2D.height = FOG_RES;
+        const fogCtx2D = fogCanvas2D.getContext('2d');
+        const fogTexture = new THREE.CanvasTexture(fogCanvas2D);
+        fogTexture.flipY = false;
+
+        // eraseArray: 1.0 = иней цел, 0.0 = стёрт курсором/каплей
+        const eraseArray = new Float32Array(FOG_RES * FOG_RES).fill(1.0);
+        let globalFogLevel = 0;
+        let fogStartTime   = 0;
+        let fogDirty       = true;
+
+        // ---- Шум для неравномерного запотевания ----
+        // Value-noise: плавные пятна разного размера
+        function _vNoise(u, v, sc) {
+            const xi = Math.floor(u * sc), yi = Math.floor(v * sc);
+            const xf = u * sc - xi,       yf = v * sc - yi;
+            const r = (ix, iy) => { const n = Math.sin(ix * 127.1 + iy * 311.7) * 43758.5453; return n - Math.floor(n); };
+            const v00 = r(xi,yi), v10 = r(xi+1,yi), v01 = r(xi,yi+1), v11 = r(xi+1,yi+1);
+            const ux = xf*xf*(3-2*xf), uy = yf*yf*(3-2*yf);
+            return v00*(1-ux)*(1-uy) + v10*ux*(1-uy) + v01*(1-ux)*uy + v11*ux*uy;
+        }
+        const fogNoise = new Float32Array(FOG_RES * FOG_RES);
+        for (let py = 0; py < FOG_RES; py++) {
+            for (let px = 0; px < FOG_RES; px++) {
+                const u = px / FOG_RES, v = py / FOG_RES;
+                // три октавы: крупные пятна + средние + мелкие
+                const n = _vNoise(u,v,4)*0.55 + _vNoise(u,v,9)*0.30 + _vNoise(u,v,18)*0.15;
+                fogNoise[py * FOG_RES + px] = n;  // 0..1
+            }
+        }
+
+        // Стираем иней в точке (u,v) с радиусом brushR (0..1)
+        function fogEraseAt(u, v, brushR) {
+            const cx = Math.round(u * (FOG_RES - 1));
+            const cy = Math.round(v * (FOG_RES - 1));
+            const r  = Math.ceil(brushR * FOG_RES);
+            for (let dy = -r; dy <= r; dy++) {
+                for (let dx = -r; dx <= r; dx++) {
+                    const d2 = dx * dx + dy * dy;
+                    if (d2 > r * r) continue;
+                    const nx = ((cx + dx) % FOG_RES + FOG_RES) % FOG_RES;
+                    const ny = cy + dy;
+                    if (ny < 0 || ny >= FOG_RES) continue;
+                    const fall = 1 - Math.sqrt(d2) / r;
+                    const i = ny * FOG_RES + nx;
+                    eraseArray[i] = Math.max(0, eraseArray[i] - fall * 0.95);
+                }
+            }
+            fogDirty = true;
+        }
+
+        // Пересобираем canvas-текстуру: неравномерное запотевание через fogNoise-пороги
+        function rebuildFogCanvas() {
+            if (!fogDirty) return;
+            fogDirty = false;
+            // roughness чистого металла = 0.24, при полном запотевании = 0.72
+            // val в канале roughnessMap: 0..255, effective_roughness = maxR * (val/255)
+            const maxR    = 0.72;
+            const CLEAR_R = 0.24 / maxR;  // ≈ 0.33
+            const img = fogCtx2D.createImageData(FOG_RES, FOG_RES);
+            const d = img.data;
+            for (let i = 0; i < FOG_RES * FOG_RES; i++) {
+                const mask = eraseArray[i];
+                // Порог появления: [0 .. 0.4] — туман нарастает быстрее
+                const thr  = fogNoise[i] * 0.40;
+                const rise = Math.min(1.0, Math.max(0, (globalFogLevel - thr) / 0.35));
+                const effectiveFog = rise * mask;
+                const val = Math.round((CLEAR_R + (1 - CLEAR_R) * effectiveFog) * 255);
+                const j = i * 4;
+                d[j] = d[j+1] = d[j+2] = val;
+                d[j+3] = 255;
+            }
+            fogCtx2D.putImageData(img, 0, 0);
+            fogTexture.needsUpdate = true;
+        }
+
+        // Глобальные fog-параметры: заметная матовость + молочный оттенок
+        function applyGlobalFog(t) {
+            models.forEach((_, idx) => {
+                if (!modelMeshes[idx]) return;
+                modelMeshes[idx].forEach(m => {
+                    if (!m.material || (m.name || '').toUpperCase().includes('RECYCLE')) return;
+                    m.material.metalness       = 1.0 - 0.40 * t;   // 1.0 → 0.60
+                    m.material.envMapIntensity = 1.2 - 0.70 * t;   // 1.2 → 0.50
+                    m.material.color.setRGB(
+                        (0xdd + (0xe8 - 0xdd) * t) / 255,
+                        (0xdf + (0xea - 0xdf) * t) / 255,
+                        (0xe4 + (0xf0 - 0xe4) * t) / 255
+                    );
+                    m.material.needsUpdate = true;
+                });
+            });
+        }
+
+        function resetFogFull() {
+            eraseArray.fill(1.0);
+            globalFogLevel = 0;
+            fogStartTime   = performance.now() / 1000;
+            fogDirty = true;
+            rebuildFogCanvas();
+            applyGlobalFog(0);
+        }
+        // ===== END FOGGING =====
+
+        // Raycaster для рисования мышью
+        const fogRaycaster = new THREE.Raycaster();
+
+        // Добавляем цилиндрические UV к геометрии.
+        // Ось высоты определяем автоматически — longest dimension в mesh-local space.
+        // Это надёжно работает и при Blender Z-up (ось = mesh-local Z)
+        // и при GLTF Y-up (ось = mesh-local Y).
+        function addCylindricalUV(geometry) {
+            geometry.computeBoundingBox();
+            const bb = geometry.boundingBox;
+            const dims = [bb.max.x-bb.min.x, bb.max.y-bb.min.y, bb.max.z-bb.min.z];
+            // hAxis = индекс самого длинного измерения (= ось цилиндра)
+            const hAxis = dims[0] >= dims[1] && dims[0] >= dims[2] ? 0
+                        : dims[1] >= dims[2]                        ? 1 : 2;
+            const mins = [bb.min.x, bb.min.y, bb.min.z];
+            const maxs = [bb.max.x, bb.max.y, bb.max.z];
+            const hMin = mins[hAxis], hMax = maxs[hAxis];
+            const hRange = Math.max(hMax - hMin, 0.001);
+            // Два оставшихся индекса — плоскость поперечного сечения
+            const c1 = (hAxis + 1) % 3;
+            const c2 = (hAxis + 2) % 3;
+
+            geometry.userData.hAxis = hAxis;
+            geometry.userData.hMin  = hMin;
+            geometry.userData.hMax  = hMax;
+            geometry.userData.c1    = c1;
+            geometry.userData.c2    = c2;
+
+            const pos   = geometry.attributes.position;
+            const count = pos.count;
+            const get   = (i, ax) => ax===0 ? pos.getX(i) : ax===1 ? pos.getY(i) : pos.getZ(i);
+            const uvs   = new Float32Array(count * 2);
+            for (let i = 0; i < count; i++) {
+                const h  = get(i, hAxis);
+                const a1 = get(i, c1);
+                const a2 = get(i, c2);
+                uvs[i*2  ] = ((Math.atan2(a1, a2) / (Math.PI * 2)) + 1.0) % 1.0;
+                uvs[i*2+1] = (hMax - h) / hRange;   // v=0 вверху, v=1 внизу
+            }
+            geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+        }
+
+        // Вычисляет UV по позиции в локальном пространстве меша (для fog-стирания)
+        function uvFromMeshLocal(pt, gd) {
+            const get = (v, ax) => ax===0 ? v.x : ax===1 ? v.y : v.z;
+            const h  = get(pt, gd.hAxis);
+            const a1 = get(pt, gd.c1);
+            const a2 = get(pt, gd.c2);
+            return {
+                u: ((Math.atan2(a1, a2) / (Math.PI * 2)) + 1.0) % 1.0,
+                v: Math.min(1, Math.max(0, (gd.hMax - h) / (gd.hMax - gd.hMin)))
+            };
+        }
+
+        function loadCan(url, modelIdx, onDone) {
+            loader.load(url, (gltf) => {
+                const group = gltf.scene;
+                let hasGLBText = false;
+                const meshList = [];
+                group.traverse(c => {
+                    if (!c.isMesh) return;
+                    meshList.push(c);
+                    if (c.name && c.name.toUpperCase().includes('RECYCLE')) {
+                        c.material = textMat.clone();
+                        hasGLBText = true;
+                    } else {
+                        // Добавляем UV цилиндрического маппинга — исходная модель без UV
+                        addCylindricalUV(c.geometry);
+                        const m = canMat.clone();
+                        m.roughness    = 0.72;
+                        m.roughnessMap = fogTexture;
+                        m.needsUpdate  = true;
+                        c.material = m;
+                    }
+                });
+                modelMeshes[modelIdx] = meshList;
+                // Центровка и масштаб
+                const box  = new THREE.Box3().setFromObject(group);
+                const center = box.getCenter(new THREE.Vector3());
+                group.position.sub(center);
+                const size = box.getSize(new THREE.Vector3());
+                const sc   = 0.9 / Math.max(size.x, size.y, size.z);
+                group.scale.setScalar(sc);
+                // 4-я банка после Y-сжатия физически меньше — компенсируем
+                if (modelIdx === 3) group.scale.multiplyScalar(1.15);
+                // Сохраняем базовый масштаб — нужен для кнопочного scale-эффекта
+                group.userData.baseScale = group.scale.x;
+                group.userData.halfH = size.y / 2;   // для цилиндрических UV по мировым координатам
+                // Наклон вниз — RECYCLE по центру видимой части
+                group.rotation.x = THREE.MathUtils.degToRad(12);
+                onDone(group, size, hasGLBText, sc);
+            });
+        }
+
+        function addTextToCan(canGroup, size) {
+            if (!loadedFont) { setTimeout(() => addTextToCan(canGroup, size), 100); return; }
+            const dims = { x: size.x, y: size.y, z: size.z };
+            const axis = Object.entries(dims).sort((a,b)=>b[1]-a[1])[0][0];
+            const radius = (axis==='x') ? Math.max(size.y, size.z)/2 : Math.max(size.x, size.z)/2;
+            const geo = new TextGeometry('RECYCLE', {
+                font: loadedFont, size: radius * 0.32, height: radius * 0.032,
+                curveSegments: 8, bevelEnabled: true, bevelThickness: radius*0.008, bevelSize: radius*0.008
+            });
+            geo.computeBoundingBox(); geo.center();
+            const textMesh = new THREE.Mesh(geo, textMat);
+            textMesh.position.set(0, 0, radius * 1.02);
+            canGroup.add(textMesh);
+        }
+
+        // Предзагрузка всех моделей сразу.
+        // Модели НЕ добавляются в сцену сразу — они остаются в памяти/GPU.
+        // scene.add/remove работает мгновенно (без повторной загрузки с сети).
+        let loadedCount = 0;
+        models.forEach((url, idx) => {
+            loadCan(url, idx, (group, size, hasGLBText, sc) => {
+                if (!hasGLBText) addTextToCan(group, size);
+                preloaded[idx] = group;
+                baseRotations[idx] = { x: group.rotation.x, y: group.rotation.y, z: group.rotation.z };
+                // Строим конденсат для этой модели
+                allDrops[idx] = buildCondensation(group, size, idx);
+                loadedCount++;
+                if (loadedCount === models.length) {
+                    allLoaded = true;
+                    const startIdx = parseInt(new URLSearchParams(location.search).get('m') || '0');
+                    currentModel = Math.min(startIdx, models.length - 1);
+                    can = preloaded[currentModel];
+                    scene.add(can);
+                    baseRotX = can.rotation.x;
+                    baseRotY = can.rotation.y;
+                    baseRotZ = can.rotation.z;
+                    canShowTime  = performance.now() / 1000;
+                    fogStartTime = canShowTime;
+                    rebuildFogCanvas();  // первый рендер текстуры
+                    document.title = 'Банка RECYCLE — 3D модель';
+                }
+            });
+        });
+
+        // ---- Клик — мгновенная смена (все модели уже в памяти) ----
+        container.addEventListener('mousedown', () => {
+            if (phase !== 'idle') return;
+            // Эффект нажатия кнопки — быстрое "вдавливание"
+            targetScale = 0.91;
+            if (!rafId) rafId = requestAnimationFrame(updateTilt);
+        });
+
+        // Предзагрузка звуков
+        const _sounds = [
+            new Audio('sounds/1.mp3'),
+            new Audio('sounds/2.mp3'),
+            new Audio('sounds/3.mp3'),
+        ];
+        function playRandomSound() {
+            const snd = _sounds[Math.floor(Math.random() * _sounds.length)];
+            snd.currentTime = 0;
+            snd.play().catch(() => {}); // игнорируем блокировку автовоспроизведения
+        }
+
+        container.addEventListener('click', () => {
+            if (!allLoaded || phase !== 'idle') return;
+            playRandomSound();
+            // Брызги конденсата с текущей банки
+            if (allDrops[currentModel]) triggerSplash(allDrops[currentModel]);
+            // убрать текущую из сцены
+            scene.remove(preloaded[currentModel]);
+            // переключить
+            currentModel = (currentModel + 1) % models.length;
+            // Сброс капель на НОВОЙ банке — чистый старт, без stale-состояний
+            if (allDrops[currentModel]) resetDrops(allDrops[currentModel]);
+            // добавить следующую — данные уже в GPU, никакой задержки
+            const next = preloaded[currentModel];
+            scene.add(next);
+            can = next;
+            baseRotX = next.rotation.x;
+            baseRotY = next.rotation.y;
+            baseRotZ = next.rotation.z;
+            // сбросить наклон, вернуть scale к hover-уровню
+            currentRx = 0; currentRy = 0;
+            targetRx = 0; targetRy = 0;
+            targetScale = isHovered ? 0.96 : 1.0;
+            currentScale = 0.91;
+            canShowTime = performance.now() / 1000; // сброс таймера капель для новой банки
+            // fogStartTime НЕ сбрасывается — это та же банка, запотевание продолжается
+            if (!rafId) rafId = requestAnimationFrame(updateTilt);
+
+            // 4-я банка — пауза 1с, потом свободное падение вниз
+            if (currentModel === models.length - 1) {
+                phase = 'waiting';
+                phaseTimer = 1.0;
+                fallVy = 0;
+                fallRvx = 0.5 + Math.random() * 0.4;
+                fallRvz = (Math.random() - 0.5) * 0.8;
+            }
+        });
+
+        function updateTilt() {
+            if (phase !== 'idle') {
+                // Во время падения тоже гасим scale обратно к 1
+                currentScale += (1.0 - currentScale) * 0.15;
+                if (can) can.scale.setScalar(currentScale * (can.userData.baseScale || 1));
+                return;
+            }
+            currentRx += (targetRx - currentRx) * LERP;
+            currentRy += (targetRy - currentRy) * LERP;
+            currentScale += (targetScale - currentScale) * LERP;
+            if (can) {
+                can.rotation.x = baseRotX + currentRx * Math.PI / 180;
+                can.rotation.y = baseRotY + currentRy * Math.PI / 180;
+                can.scale.setScalar(currentScale * (can.userData.baseScale || 1));
+            }
+            const done = Math.abs(currentRx - targetRx) < 0.02
+                      && Math.abs(currentRy - targetRy) < 0.02
+                      && Math.abs(currentScale - targetScale) < 0.001;
+            rafId = done ? null : requestAnimationFrame(updateTilt);
+        }
+
+        container.addEventListener('mouseenter', () => {
+            if (phase !== 'idle') return;
+            isHovered = true;
+            targetScale = 0.96;
+            if (!rafId) rafId = requestAnimationFrame(updateTilt);
+        });
+
+        container.addEventListener('mousemove', (e) => {
+            if (phase !== 'idle') return;
+            const rect = container.getBoundingClientRect();
+            const x = ((e.clientX - rect.left) / rect.width) * 100;
+            const y = ((e.clientY - rect.top) / rect.height) * 100;
+            targetRy = (x - 50) / 50 * MAX_TILT;
+            targetRx = (50 - y) / 50 * MAX_TILT;
+            if (!rafId) rafId = requestAnimationFrame(updateTilt);
+
+            // Рисуем по запотеванию: прямой геометрический луч → хит
+            if (can && modelMeshes[currentModel]) {
+                const tx = (e.clientX - rect.left) / rect.width;
+                const ty = (e.clientY - rect.top)  / rect.height;
+                const wx = -RIGHT_W + tx * 2 * RIGHT_W;
+                const wy = TOP_W * (1 - 2 * ty);
+                fogRaycaster.ray.origin.set(0, 0, CAM_D);
+                fogRaycaster.ray.direction.set(wx, wy, -CAM_D).normalize();
+
+                // Убедимся что матрицы актуальны
+                can.updateMatrixWorld(true);
+
+                const targets = modelMeshes[currentModel].filter(
+                    m => !(m.name || '').toUpperCase().includes('RECYCLE')
+                );
+                const hits = fogRaycaster.intersectObjects(targets, true);
+
+                // ── DEBUG-оверлей (удалить после теста) ──────────────────
+                if (!window._dbgDiv) {
+                    window._dbgDiv = document.createElement('div');
+                    window._dbgDiv.style.cssText =
+                        'position:fixed;bottom:8px;left:8px;background:rgba(0,0,0,.75);' +
+                        'color:#0f0;padding:6px 10px;font:11px/1.4 monospace;z-index:9999;' +
+                        'pointer-events:none;border-radius:4px;';
+                    document.body.appendChild(window._dbgDiv);
+                }
+                window._dbgDiv.innerHTML =
+                    `fog: ${globalFogLevel.toFixed(3)}<br>` +
+                    `targets: ${targets.length}<br>` +
+                    `hits: ${hits.length}<br>` +
+                    `uv: ${hits[0]?.uv ? hits[0].uv.x.toFixed(2)+','+hits[0].uv.y.toFixed(2) : 'null'}`;
+                // ─────────────────────────────────────────────────────────
+
+                if (globalFogLevel > 0.005 && hits.length > 0) {
+                    const hitMesh = hits[0].object;
+                    const pt = hits[0].point.clone();
+                    hitMesh.worldToLocal(pt);
+                    const gd = hitMesh.geometry.userData;
+                    if (gd.hAxis !== undefined) {
+                        const uv = uvFromMeshLocal(pt, gd);
+                        fogEraseAt(uv.u, uv.v, 0.06);
+                    }
+                }
+            }
+        });
+
+        container.addEventListener('mouseleave', () => {
+            isHovered = false;
+            targetRx = 0;
+            targetRy = 0;
+            targetScale = 1.0;
+            if (!rafId) rafId = requestAnimationFrame(updateTilt);
+        });
+
+        function animate(time) {
+            requestAnimationFrame(animate);
+            const dt = lastTime ? Math.min((time - lastTime) / 1000, 0.05) : 0;
+            lastTime = time;
+
+            // Обновляем отсоединённые брызги (летят независимо от текущей модели)
+            for (let i = _flyMeshes.length - 1; i >= 0; i--) {
+                const f = _flyMeshes[i];
+                f.vy -= 4.0 * dt;
+                f.mesh.position.x += f.vx * dt;
+                f.mesh.position.y += f.vy * dt;
+                f.mesh.position.z += f.vz * dt;
+                // Затухание начинается только после 0.25с, чтобы дуга была видна
+                f.age += dt;
+                f.opacity -= Math.max(0, f.age - 0.25) * dt * 2.5;
+                f.mesh.material.opacity = Math.max(0, f.opacity);
+                if (f.opacity <= 0) {
+                    scene.remove(f.mesh);
+                    f.mesh.geometry.dispose();
+                    f.mesh.material.dispose();
+                    _flyMeshes.splice(i, 1);
+                }
+            }
+
+            // Обновляем конденсат и запотевание
+            if ((phase === 'idle' || phase === 'waiting') && allLoaded) {
+                const elapsed    = time / 1000 - canShowTime;
+                const fogElapsed = time / 1000 - fogStartTime;
+
+                if (allDrops[currentModel]) updateCondensation(allDrops[currentModel], elapsed, dt);
+
+                // Запотевание нарастает: до 0.65 за ~13с, потом до 1.0 за ещё ~17с
+                if (fogElapsed > 1.5) {
+                    const prev = globalFogLevel;
+                    const rate = globalFogLevel < 0.65 ? 0.05 : 0.02;
+                    globalFogLevel = Math.min(globalFogLevel + dt * rate, 1.0);
+                    if (globalFogLevel !== prev) {
+                        applyGlobalFog(globalFogLevel);
+                        fogDirty = true;
+                    }
+                }
+                rebuildFogCanvas();
+            }
+
+            if (phase === 'waiting') {
+                // Банка висит на месте — ждём 1 секунду
+                phaseTimer -= dt;
+                if (phaseTimer <= 0) phase = 'falling';
+
+            } else if (phase === 'falling') {
+                // Свободное падение с гравитацией
+                fallVy -= GRAVITY * dt;
+                can.position.y += fallVy * dt;
+                can.rotation.x += fallRvx * dt;
+                can.rotation.z += fallRvz * dt;
+
+                // Банка ушла далеко за нижний край экрана
+                if (can.position.y < -6.5) {
+                    phase = 'resetting';
+                    phaseTimer = 1.15; // ~1 секунда паузы перед появлением первой банки
+                }
+
+            } else if (phase === 'resetting') {
+                phaseTimer -= dt;
+                if (phaseTimer <= 0) {
+                    const fallenIdx = currentModel;
+                    const fallen = preloaded[fallenIdx];
+
+                    // 1. Сначала убираем из сцены — никакого мигания
+                    scene.remove(fallen);
+
+                    // 2. Потом сбрасываем трансформ (пока не в сцене — невидимо)
+                    const br = baseRotations[fallenIdx];
+                    fallen.position.set(0, 0, 0);
+                    fallen.rotation.set(br.x, br.y, br.z);
+
+                    // 3. Сброс конденсата и полного запотевания для следующего цикла
+                    allDrops.forEach(drops => { if (drops) resetDrops(drops); });
+                    resetFogFull();
+
+                    // 4. Готовим первую банку и добавляем
+                    currentModel = 0;
+                    can = preloaded[0];
+                    const br0 = baseRotations[0];
+                    can.position.set(0, 0, 0);
+                    can.rotation.set(br0.x, br0.y, br0.z);
+                    baseRotX = br0.x; baseRotY = br0.y; baseRotZ = br0.z;
+                    currentRx = 0; currentRy = 0;
+                    targetRx = 0; targetRy = 0;
+                    canShowTime = time / 1000;
+                    phase = 'idle';
+
+                    // 4. В сцену — в самом конце, уже после сброса состояния
+                    scene.add(can);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>
