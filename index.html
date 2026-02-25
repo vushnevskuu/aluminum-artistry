@@ -5,12 +5,15 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Банка RECYCLE — 3D модель</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@900&display=swap');
         * { margin: 0; padding: 0; }
         body {
             height: 100vh;
             overflow: hidden;
-            background: #e8e8e8;
+            background-color: #fff;
+            background-image: url(vector.svg);
+            background-position: center;
+            background-repeat: no-repeat;
+            background-size: contain;
         }
         #wrapper {
             position: fixed;
@@ -21,17 +24,17 @@
             justify-content: center;
             pointer-events: none;
         }
-        #headline {
-            font-family: 'Inter', 'Arial Black', sans-serif;
-            font-weight: 900;
-            font-size: clamp(96px, 18vw, 240px);
-            line-height: 0.90;
-            letter-spacing: -0.03em;
-            color: #0a0a0a;
-            text-align: center;
-            text-transform: uppercase;
-            user-select: none;
-            margin-bottom: -10px;
+        #can-shadow {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, 38%);
+            width: 400px;
+            height: 100px;
+            border-radius: 50%;
+            background: radial-gradient(ellipse 70% 40% at 50% 50%, rgba(0,0,0,0.32), rgba(0,0,0,0.12) 40%, rgba(0,0,0,0.04) 65%, transparent 80%);
+            filter: blur(18px);
+            z-index: 0;
         }
         #container {
             width: 660px;
@@ -39,6 +42,7 @@
             cursor: pointer;
             pointer-events: auto;
             position: relative;
+            z-index: 1;
             /* overflow намеренно не hidden — холст свисает вниз,
                банка летит до реального низа экрана */
         }
@@ -53,7 +57,7 @@
 </head>
 <body>
     <div id="wrapper">
-        <h1 id="headline">Crush it,<br>recycle it.</h1>
+        <div id="can-shadow"></div>
         <div id="container"></div>
     </div>
 
@@ -104,7 +108,7 @@
         const GRAVITY = 7.0;
 
         const scene = new THREE.Scene();
-        scene.background = new THREE.Color(0xe8e8e8);
+        scene.background = null;
 
         // Асимметричный frustum: верхние 270px — оригинальный вид (±0.69 ед.),
         // холст расширен до 720px вниз → банка падает в скрытые 450px без GPU-клипа.
@@ -128,7 +132,8 @@
         camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
 
         // canvas height = (TOP_W + |BOTTOM_W|) / 1.38 * 270 = 7.69/1.38*270 ≈ 1506px
-        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setClearColor(0x000000, 0);
         renderer.setSize(660, 1506);
         renderer.setPixelRatio(window.devicePixelRatio);
         renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -140,8 +145,8 @@
         const pmrem = new THREE.PMREMGenerator(renderer);
         scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
-        // Ambient — базовое освещение
-        const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+        // Ambient — базовое освещение (чуть выше, чтобы низ не уходил в чёрный)
+        const ambient = new THREE.AmbientLight(0xffffff, 0.85);
         scene.add(ambient);
 
         // Ключевой свет сверху-слева
@@ -153,13 +158,18 @@
         fill.position.set(3, 1, 3);
         scene.add(fill);
 
-        const rim = new THREE.DirectionalLight(0xffffff, 0.5);
+        const rim = new THREE.DirectionalLight(0xffffff, 0.85);
         rim.position.set(0, -3, -2);
         scene.add(rim);
 
         const top = new THREE.DirectionalLight(0xffffff, 0.4);
         top.position.set(0, 5, 0);
         scene.add(top);
+
+        // Подсветка снизу — чтобы низ банки не был чёрным в первые секунды
+        const bottomFill = new THREE.DirectionalLight(0xffffff, 0.7);
+        bottomFill.position.set(0, -4, 3);
+        scene.add(bottomFill);
 
         // Фронтальный свет — важен для 4-го состояния (плоская банка)
         const front = new THREE.DirectionalLight(0xffffff, 1.2);
@@ -840,7 +850,7 @@
                 const center = box.getCenter(new THREE.Vector3());
                 group.position.sub(center);
                 const size = box.getSize(new THREE.Vector3());
-                const sc   = 0.9 / Math.max(size.x, size.y, size.z);
+                const sc   = (1.8 / 1.3) / Math.max(size.x, size.y, size.z);
                 group.scale.setScalar(sc);
                 // 4-я банка после Y-сжатия физически меньше — компенсируем
                 if (modelIdx === 3) group.scale.multiplyScalar(1.15);
@@ -1138,11 +1148,17 @@
                     baseRotX = br0.x; baseRotY = br0.y; baseRotZ = br0.z;
                     currentRx = 0; currentRy = 0;
                     targetRx = 0; targetRy = 0;
+                    currentScale = 1.0;
+                    targetScale = 1.0;
+                    can.scale.setScalar(can.userData.baseScale || 1);
                     canShowTime = time / 1000;
                     phase = 'idle';
 
-                    // 4. В сцену — в самом конце, уже после сброса состояния
+                    // В сцену — в самом конце, уже после сброса состояния
                     scene.add(can);
+
+                    // Запускаем цикл наклона заново, иначе ховер после появления не сработает
+                    if (!rafId) rafId = requestAnimationFrame(updateTilt);
                 }
             }
 
